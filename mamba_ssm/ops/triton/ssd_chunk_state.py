@@ -69,6 +69,8 @@ def _chunk_cumsum_fwd_kernel(
         dt += dt_bias[:, None]
     if DT_SOFTPLUS:
         dt = tl.where(dt <= 20.0, softplus(dt), dt)
+    else:
+        dt = tl.maximum(dt, 0.0)
     # As of Triton 2.2.0, tl.clamp is not available yet
     # dt = tl.clamp(dt, dt_min, dt_max)
     dt = tl.minimum(tl.maximum(dt, dt_min), dt_max)
@@ -142,6 +144,8 @@ def _chunk_cumsum_bwd_kernel(
     if DT_SOFTPLUS:
         dt_presoftplus = dt
         dt = tl.where(dt <= 20.0, softplus(dt), dt)
+    else:
+        dt = tl.maximum(dt, 0.0)
     clamp_mask = (dt < dt_min) | (dt > dt_max)
     # As of Triton 2.2.0, tl.clamp is not available yet
     # dt = tl.clamp(dt, dt_min, dt_max)
@@ -151,6 +155,8 @@ def _chunk_cumsum_bwd_kernel(
     ddt = tl.where(clamp_mask, 0.0, ddt)
     if DT_SOFTPLUS:
         ddt = tl.where(dt_presoftplus <= 20.0, ddt * tl.sigmoid(dt_presoftplus), ddt)
+    else:
+        ddt = ddt * (dt_pre > 0.0)
     tl.store(ddt_ptrs, ddt, mask=(offs_h[:, None] < nheads) & (offs_c[None, :] < chunk_size_limit))
     dA = tl.sum(ddA * dt, axis=1)
     tl.atomic_add(dA_ptr + offs_h * stride_dA_head, dA, mask=offs_h < nheads)

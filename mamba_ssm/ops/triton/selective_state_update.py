@@ -95,6 +95,8 @@ def _selective_scan_update_kernel(
             dt += tl.load(dt_bias_ptrs, mask=offs_m < dim, other=0.0).to(tl.float32)
         if DT_SOFTPLUS:
             dt = tl.where(dt <= 20.0, softplus(dt), dt)
+        else:
+            dt = tl.maximum(dt, 0.0)
         A = tl.load(A_ptrs, mask=(offs_m[:, None] < dim) & (offs_n[None, :] < dstate), other=0.0).to(tl.float32)
         dA = tl.exp(A * dt[:, None])
     else:
@@ -103,6 +105,8 @@ def _selective_scan_update_kernel(
             dt += tl.load(dt_bias_ptr).to(tl.float32)
         if DT_SOFTPLUS:
             dt = tl.where(dt <= 20.0, softplus(dt), dt)
+        else:
+            dt = tl.maximum(dt, 0.0)
         A = tl.load(A_ptr).to(tl.float32)
         dA = tl.exp(A * dt)  # scalar, not a matrix
 
@@ -265,7 +269,7 @@ def selective_state_update_ref(state, x, dt, A, B, C, D=None, z=None, dt_bias=No
     if dt_bias is not None:
         assert dt_bias.shape == (nheads, dim)
         dt = dt + dt_bias
-    dt = F.softplus(dt) if dt_softplus else dt
+    dt = F.softplus(dt) if dt_softplus else F.relu(dt)
     dA = torch.exp(rearrange(dt, "b h d -> b h d 1") * A)  # (batch, nheads, dim, dstate)
     B = repeat(B, "b g n -> b (g h) n", h=nheads // ngroups)  # (batch, nheads, dstate)
     C = repeat(C, "b g n -> b (g h) n", h=nheads // ngroups)  # (batch, nheads, dstate)
