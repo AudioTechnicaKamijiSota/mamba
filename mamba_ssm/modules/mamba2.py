@@ -24,6 +24,7 @@ except ImportError:
     selective_state_update = None
 
 from mamba_ssm.ops.triton.layernorm_gated import RMSNorm as RMSNormGated
+from mamba_ssm.ops.triton.layernorm_gated import LayerNorm as LayerNormGated
 
 from mamba_ssm.distributed.tensor_parallel import ColumnParallelLinear, RowParallelLinear
 from mamba_ssm.distributed.distributed_utils import all_reduce, reduce_scatter
@@ -48,6 +49,7 @@ class Mamba2(nn.Module, PyTorchModelHubMixin):
         A_init_range=(1, 16),
         D_has_hdim=False,
         rmsnorm=True,
+        rmsnorm_to_layernorm=False,
         norm_before_gate=False,
         dt_min=0.001,
         dt_max=0.1,
@@ -140,9 +142,15 @@ class Mamba2(nn.Module, PyTorchModelHubMixin):
         self.D._no_weight_decay = True
 
         if self.rmsnorm:
-            assert RMSNormGated is not None
-            self.norm = RMSNormGated(self.d_ssm, eps=1e-5, norm_before_gate=self.norm_before_gate,
-                                     group_size=self.d_ssm // ngroups, **factory_kwargs)
+            if rmsnorm_to_layernorm:
+                assert LayerNormGated is not None
+                self.norm = LayerNormGated(self.d_ssm, eps=1e-5, norm_before_gate=self.norm_before_gate,
+                                         group_size=self.d_ssm // ngroups, **factory_kwargs)
+                self.use_mem_eff_path = False # mem_eff_path not support LayerNorm
+            else:
+                assert RMSNormGated is not None
+                self.norm = RMSNormGated(self.d_ssm, eps=1e-5, norm_before_gate=self.norm_before_gate,
+                                         group_size=self.d_ssm // ngroups, **factory_kwargs)
 
         if self.process_group is None:
             self.out_proj = nn.Linear(self.d_inner, self.d_model, bias=bias, **factory_kwargs)
