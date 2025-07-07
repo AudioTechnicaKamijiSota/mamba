@@ -51,6 +51,7 @@ class Mamba2(nn.Module, PyTorchModelHubMixin):
         rmsnorm=True,
         rmsnorm_to_layernorm=False,
         norm_before_gate=False,
+        silu_to_hardswish=False,
         dt_min=0.001,
         dt_max=0.1,
         dt_init_floor=1e-4,
@@ -89,7 +90,6 @@ class Mamba2(nn.Module, PyTorchModelHubMixin):
         self.rmsnorm = rmsnorm
         self.norm_before_gate = norm_before_gate
         self.dt_limit = dt_limit
-        self.activation = "silu"
         self.chunk_size = chunk_size
         self.use_mem_eff_path = use_mem_eff_path
         self.layer_idx = layer_idx
@@ -116,7 +116,13 @@ class Mamba2(nn.Module, PyTorchModelHubMixin):
         if self.conv_init is not None:
             nn.init.uniform_(self.conv1d.weight, -self.conv_init, self.conv_init)
 
-        self.act = nn.SiLU()
+        if silu_to_hardswish:
+            self.activation = "hardswish"
+            self.act = nn.Hardswish()
+            self.use_mem_eff_path = False # mem_eff_path not support Hardswish    
+        else:
+            self.activation = "silu"
+            self.act = nn.SiLU()
 
         # Initialize log dt bias
         dt = torch.exp(
@@ -234,7 +240,7 @@ class Mamba2(nn.Module, PyTorchModelHubMixin):
                         xBC.squeeze(0), cu_seqlens, state_len=conv_state.shape[-1]
                     )
                     conv_state.copy_(conv_varlen_states)
-            assert self.activation in ["silu", "swish"]
+            assert self.activation in ["silu", "swish", "hardswish"]
             if causal_conv1d_fn is None or self.activation not in ["silu", "swish"]:
                 assert seq_idx is None, "varlen conv1d requires the causal_conv1d package"
                 xBC = self.act(
@@ -277,7 +283,7 @@ class Mamba2(nn.Module, PyTorchModelHubMixin):
             if self.rmsnorm:
                 y = self.norm(y, z)
             if d_mlp > 0:
-                y = torch.cat([F.silu(z0) * x0, y], dim=-1)
+                y = torch.cat([self.act(z0) * x0, y], dim=-1)
             if seqlen_og is not None:
                 y = rearrange(y, "b l d -> (b l) d")
             out = self.out_proj(y)
@@ -295,7 +301,7 @@ class Mamba2(nn.Module, PyTorchModelHubMixin):
         )
 
         # Conv step
-        if causal_conv1d_update is None:
+        if causal_conv1d_update is None or self.activation not in ["silu", "swish"]::
             conv_state.copy_(torch.roll(conv_state, shifts=-1, dims=-1))  # Update state (B D W)
             conv_state[:, :, -1] = xBC
             xBC = torch.sum(conv_state * rearrange(self.conv1d.weight, "d 1 w -> d w"), dim=-1)  # (B D)
@@ -346,7 +352,7 @@ class Mamba2(nn.Module, PyTorchModelHubMixin):
         if self.rmsnorm:
             y = self.norm(y, z)
         if d_mlp > 0:
-            y = torch.cat([F.silu(z0) * x0, y], dim=-1)
+            y = torch.cat([self.act(z0) * x0, y], dim=-1)
         out = self.out_proj(y)
         return out.unsqueeze(1), conv_state, ssm_state
 
