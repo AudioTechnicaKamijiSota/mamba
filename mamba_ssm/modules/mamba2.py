@@ -305,7 +305,7 @@ class Mamba2(nn.Module, PyTorchModelHubMixin):
         )
 
         # Conv step
-        if causal_conv1d_update is None or self.activation not in ["silu", "swish"]::
+        if causal_conv1d_update is None or self.activation not in ["silu", "swish"]:
             conv_state.copy_(torch.roll(conv_state, shifts=-1, dims=-1))  # Update state (B D W)
             conv_state[:, :, -1] = xBC
             xBC = torch.sum(conv_state * rearrange(self.conv1d.weight, "d 1 w -> d w"), dim=-1)  # (B D)
