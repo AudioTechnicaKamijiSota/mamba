@@ -156,7 +156,7 @@ def _chunk_cumsum_bwd_kernel(
     if DT_SOFTPLUS:
         ddt = tl.where(dt_presoftplus <= 20.0, ddt * tl.sigmoid(dt_presoftplus), ddt)
     else:
-        ddt = ddt * (dt_pre > 0.0)
+        ddt = tl.where(dt > 0.0, ddt, 0.0)
     tl.store(ddt_ptrs, ddt, mask=(offs_h[:, None] < nheads) & (offs_c[None, :] < chunk_size_limit))
     dA = tl.sum(ddA * dt, axis=1)
     tl.atomic_add(dA_ptr + offs_h * stride_dA_head, dA, mask=offs_h < nheads)
