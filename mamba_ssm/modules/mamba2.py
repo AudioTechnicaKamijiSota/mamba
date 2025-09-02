@@ -35,6 +35,31 @@ from mamba_ssm.ops.triton.ssd_combined import mamba_split_conv1d_scan_combined
 from huggingface_hub import PyTorchModelHubMixin
 
 
+class RangeNormGated(torch.nn.Module):
+    def __init__(self, hidden_size, eps=1e-5, device=None, dtype=None):
+        factory_kwargs = {"device": device, "dtype": dtype}
+        super().__init__()
+        self.eps = eps
+        self.weight = torch.nn.Parameter(torch.empty(hidden_size, **factory_kwargs))
+        self.bias = torch.nn.Parameter(torch.empty(hidden_size, **factory_kwargs))
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        torch.nn.init.ones_(self.weight)
+        torch.nn.init.zeros_(self.bias)
+
+    def forward(self, x, z):
+        """norm(x * silu(z))
+        """
+        x = x * F.silu(z)
+        min, max = torch.aminmax(x, dim=-1, keepdim=True)
+        inv_range = (max - min).add(self.eps).reciprocal_()
+        normed = x - torch.mean(x, dim=-1, keepdim=True)
+        normed.mul_(inv_range)
+        y = torch.addcmul(self.bias, normed, self.weight)
+        return y
+
+
 class Mamba2(nn.Module, PyTorchModelHubMixin):
     def __init__(
         self,
@@ -48,10 +73,9 @@ class Mamba2(nn.Module, PyTorchModelHubMixin):
         ngroups=1,
         A_init_range=(1, 16),
         D_has_hdim=False,
-        rmsnorm=True,
-        rmsnorm_to_layernorm=False,
+        normalize=True,
+        norm_function="RMSNorm",
         norm_before_gate=False,
-        silu_to_hardswish=False,
         softplus_to_relu=False,
         dt_min=0.001,
         dt_max=0.1,
@@ -88,7 +112,7 @@ class Mamba2(nn.Module, PyTorchModelHubMixin):
         assert self.d_ssm % self.headdim == 0
         self.nheads = self.d_ssm // self.headdim
         self.D_has_hdim = D_has_hdim
-        self.rmsnorm = rmsnorm
+        self.normalize = normalize
         self.norm_before_gate = norm_before_gate
         self.dt_softplus = not softplus_to_relu
         if softplus_to_relu:
@@ -120,13 +144,8 @@ class Mamba2(nn.Module, PyTorchModelHubMixin):
         if self.conv_init is not None:
             nn.init.uniform_(self.conv1d.weight, -self.conv_init, self.conv_init)
 
-        if silu_to_hardswish:
-            self.activation = "hardswish"
-            self.act = nn.Hardswish()
-            self.use_mem_eff_path = False # mem_eff_path not support Hardswish    
-        else:
-            self.activation = "silu"
-            self.act = nn.SiLU()
+        self.activation = "silu"
+        self.act = nn.SiLU()
 
         # Initialize log dt bias
         dt = torch.exp(
@@ -151,8 +170,13 @@ class Mamba2(nn.Module, PyTorchModelHubMixin):
         self.D = nn.Parameter(torch.ones(self.d_ssm if self.D_has_hdim else self.nheads, device=device))
         self.D._no_weight_decay = True
 
-        if self.rmsnorm:
-            if rmsnorm_to_layernorm:
+        if self.normalize:
+            if norm_function == "RangeNorm":
+                assert ngroups == 1
+                assert norm_before_gate == False
+                self.norm = RangeNormGated(self.d_ssm, eps=1e-5, **factory_kwargs)
+                self.use_mem_eff_path = False # mem_eff_path not support RangeNorm
+            elif norm_function == "LayerNorm":
                 assert LayerNormGated is not None
                 self.norm = LayerNormGated(self.d_ssm, eps=1e-5, norm_before_gate=self.norm_before_gate,
                                          group_size=self.d_ssm // ngroups, **factory_kwargs)
@@ -210,8 +234,8 @@ class Mamba2(nn.Module, PyTorchModelHubMixin):
                 chunk_size=self.chunk_size,
                 seq_idx=seq_idx,
                 activation=self.activation,
-                rmsnorm_weight=self.norm.weight if self.rmsnorm else None,
-                rmsnorm_eps=self.norm.eps if self.rmsnorm else 1e-6,
+                rmsnorm_weight=self.norm.weight if self.normalize else None,
+                rmsnorm_eps=self.norm.eps if self.normalize else 1e-6,
                 outproj_weight=self.out_proj.weight,
                 outproj_bias=self.out_proj.bias,
                 headdim=None if self.D_has_hdim else self.headdim,
@@ -267,7 +291,7 @@ class Mamba2(nn.Module, PyTorchModelHubMixin):
                 rearrange(C, "b l (g n) -> b l g n", g=self.ngroups),
                 chunk_size=self.chunk_size,
                 D=rearrange(self.D, "(h p) -> h p", p=self.headdim) if self.D_has_hdim else self.D,
-                z=rearrange(z, "b l (h p) -> b l h p", p=self.headdim) if not self.rmsnorm else None,
+                z=rearrange(z, "b l (h p) -> b l h p", p=self.headdim) if not self.normalize else None,
                 dt_bias=self.dt_bias,
                 dt_softplus=self.dt_softplus,
                 seq_idx=seq_idx,
@@ -284,7 +308,7 @@ class Mamba2(nn.Module, PyTorchModelHubMixin):
                     varlen_states = rest[0]
                     ssm_state.copy_(varlen_states)
             y = rearrange(y, "b l h p -> b l (h p)")
-            if self.rmsnorm:
+            if self.normalize:
                 y = self.norm(y, z)
             if d_mlp > 0:
                 y = torch.cat([self.act(z0) * x0, y], dim=-1)
@@ -339,7 +363,7 @@ class Mamba2(nn.Module, PyTorchModelHubMixin):
             y = torch.einsum("bhpn,bn->bhp", ssm_state.to(dtype), C)
             y = y + rearrange(self.D.to(dtype), "h -> h 1") * x
             y = rearrange(y, "b h p -> b (h p)")
-            if not self.rmsnorm:
+            if not self.normalize:
                 y = y * self.act(z)  # (B D)
         else:
             A = repeat(A, "h -> h p n", p=self.headdim, n=self.d_state).to(dtype=torch.float32)
@@ -349,14 +373,14 @@ class Mamba2(nn.Module, PyTorchModelHubMixin):
             B = rearrange(B, "b (g n) -> b g n", g=self.ngroups)
             C = rearrange(C, "b (g n) -> b g n", g=self.ngroups)
             x_reshaped = rearrange(x, "b (h p) -> b h p", p=self.headdim)
-            if not self.rmsnorm:
+            if not self.normalize:
                 z = rearrange(z, "b (h p) -> b h p", p=self.headdim)
             y = selective_state_update(
-                ssm_state, x_reshaped, dt, A, B, C, D, z=z if not self.rmsnorm else None,
+                ssm_state, x_reshaped, dt, A, B, C, D, z=z if not self.normalize else None,
                 dt_bias=dt_bias, dt_softplus=self.dt_softplus
             )
             y = rearrange(y, "b h p -> b (h p)")
-        if self.rmsnorm:
+        if self.normalize:
             y = self.norm(y, z)
         if d_mlp > 0:
             y = torch.cat([self.act(z0) * x0, y], dim=-1)
