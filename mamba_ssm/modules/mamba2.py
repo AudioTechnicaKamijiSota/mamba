@@ -52,9 +52,9 @@ class RangeNormGated(torch.nn.Module):
         """norm(x * silu(z))
         """
         x = x * F.silu(z)
-        amin = torch.amin(x, dim=-1, keepdim=True)
-        amax = torch.amax(x, dim=-1, keepdim=True)
-        inv_range = (max - min).add(self.eps).reciprocal_()
+        x_min = torch.amin(x, dim=-1, keepdim=True)
+        x_max = torch.amax(x, dim=-1, keepdim=True)
+        inv_range = (x_max - x_min).add(self.eps).reciprocal_()
         normed = x - torch.mean(x, dim=-1, keepdim=True)
         normed.mul_(inv_range)
         y = normed * self.weight + self.bias
