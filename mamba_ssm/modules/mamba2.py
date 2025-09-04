@@ -36,27 +36,28 @@ from huggingface_hub import PyTorchModelHubMixin
 
 
 class RangeNormGated(torch.nn.Module):
-    def __init__(self, hidden_size, eps=1e-5, device=None, dtype=None):
+    def __init__(self, hidden_size, eps=1e-4, detach_range=False, device=None, dtype=None):
         factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__()
         self.eps = eps
         self.weight = torch.nn.Parameter(torch.empty(hidden_size, **factory_kwargs))
         self.bias = torch.nn.Parameter(torch.empty(hidden_size, **factory_kwargs))
-        self.reset_parameters()
-
-    def reset_parameters(self):
-        torch.nn.init.ones_(self.weight)
+        gamma = 2.0 * math.sqrt(2.0 * math.log(float(hidden_size)))
+        torch.nn.init.constant_(self.weight, gamma)
         torch.nn.init.zeros_(self.bias)
+        self.detach_range = detach_range
 
     def forward(self, x, z):
         """norm(x * silu(z))
         """
         x = x * F.silu(z)
-        x_min = torch.amin(x, dim=-1, keepdim=True)
-        x_max = torch.amax(x, dim=-1, keepdim=True)
-        inv_range = (x_max - x_min).add(self.eps).reciprocal_()
         normed = x - torch.mean(x, dim=-1, keepdim=True)
-        normed.mul_(inv_range)
+        normed_min = torch.amin(normed, dim=-1, keepdim=True)
+        normed_max = torch.amax(normed, dim=-1, keepdim=True)
+        inv_range = (normed_max - normed_min).add(self.eps).reciprocal_()
+        if self.detach_range:
+            inv_range = inv_range.detach()
+        normed = normed * inv_range
         y = normed * self.weight + self.bias
         return y
 
