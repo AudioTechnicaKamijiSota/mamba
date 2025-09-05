@@ -36,7 +36,7 @@ from huggingface_hub import PyTorchModelHubMixin
 
 
 class RangeNormGated(torch.nn.Module):
-    def __init__(self, hidden_size, eps=1e-4, detach_range=False, device=None, dtype=None):
+    def __init__(self, hidden_size, eps=1e-4, detach_range=True, device=None, dtype=None):
         factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__()
         self.eps = eps
@@ -51,6 +51,7 @@ class RangeNormGated(torch.nn.Module):
         """norm(x * silu(z))
         """
         x = x * F.silu(z)
+        x = x.float()
         normed = x - torch.mean(x, dim=-1, keepdim=True)
         normed_min = torch.amin(normed, dim=-1, keepdim=True)
         normed_max = torch.amax(normed, dim=-1, keepdim=True)
@@ -58,6 +59,7 @@ class RangeNormGated(torch.nn.Module):
         if self.detach_range:
             inv_range = inv_range.detach()
         normed = normed * inv_range
+        normed = normed.to(x.dtype)
         y = normed * self.weight + self.bias
         return y
 
@@ -176,7 +178,7 @@ class Mamba2(nn.Module, PyTorchModelHubMixin):
             if norm_function == "RangeNorm":
                 assert ngroups == 1
                 assert norm_before_gate == False
-                self.norm = RangeNormGated(self.d_ssm, eps=1e-5, **factory_kwargs)
+                self.norm = RangeNormGated(self.d_ssm, eps=1e-4, **factory_kwargs)
                 self.use_mem_eff_path = False # mem_eff_path not support RangeNorm
             elif norm_function == "LayerNorm":
                 assert LayerNormGated is not None
