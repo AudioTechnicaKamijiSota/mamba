@@ -77,6 +77,7 @@ class Mamba2(nn.Module, PyTorchModelHubMixin):
         D_has_hdim=False,
         normalize=True,
         norm_function="RMSNorm",
+        norm_eps=1e-5,
         norm_before_gate=False,
         softplus_to_relu=False,
         dt_min=0.001,
@@ -176,17 +177,20 @@ class Mamba2(nn.Module, PyTorchModelHubMixin):
             if norm_function == "RangeNorm":
                 assert ngroups == 1
                 assert norm_before_gate == False
-                self.norm = RangeNormGated(self.d_ssm, eps=1e-4, **factory_kwargs)
+                self.norm = RangeNormGated(self.d_ssm, eps=norm_eps, **factory_kwargs)
                 self.use_mem_eff_path = False # mem_eff_path not support RangeNorm
             elif norm_function == "LayerNorm":
                 assert LayerNormGated is not None
-                self.norm = LayerNormGated(self.d_ssm, eps=1e-5, norm_before_gate=self.norm_before_gate,
+                self.norm = LayerNormGated(self.d_ssm, eps=norm_eps, norm_before_gate=self.norm_before_gate,
                                          group_size=self.d_ssm // ngroups, **factory_kwargs)
                 self.use_mem_eff_path = False # mem_eff_path not support LayerNorm
             else:
                 assert RMSNormGated is not None
-                self.norm = RMSNormGated(self.d_ssm, eps=1e-5, norm_before_gate=self.norm_before_gate,
+                self.norm = RMSNormGated(self.d_ssm, eps=norm_eps, norm_before_gate=self.norm_before_gate,
                                          group_size=self.d_ssm // ngroups, **factory_kwargs)
+        else:
+            self.norm = None
+            self.use_mem_eff_path = False
 
         if self.process_group is None:
             self.out_proj = nn.Linear(self.d_inner, self.d_model, bias=bias, **factory_kwargs)
@@ -312,6 +316,8 @@ class Mamba2(nn.Module, PyTorchModelHubMixin):
             y = rearrange(y, "b l h p -> b l (h p)")
             if self.normalize:
                 y = self.norm(y, z)
+            else: # gate only
+                y = y * self.act(z)
             if d_mlp > 0:
                 y = torch.cat([self.act(z0) * x0, y], dim=-1)
             if seqlen_og is not None:
@@ -384,6 +390,8 @@ class Mamba2(nn.Module, PyTorchModelHubMixin):
             y = rearrange(y, "b h p -> b (h p)")
         if self.normalize:
             y = self.norm(y, z)
+        else: # gate only
+            y = y * self.act(z)
         if d_mlp > 0:
             y = torch.cat([self.act(z0) * x0, y], dim=-1)
         out = self.out_proj(y)
