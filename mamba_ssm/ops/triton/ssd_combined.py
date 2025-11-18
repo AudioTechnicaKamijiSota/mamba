@@ -618,6 +618,8 @@ def mamba_chunk_scan(x, dt, A, B, C, chunk_size, D=None, z=None, dt_bias=None, d
         dt = dt + rearrange(dt_bias, "h -> h 1 1")
     if dt_softplus:
         dt = F.softplus(dt)
+    else:
+        dt = F.relu(dt)
     dA = dt * rearrange(A, "h -> h 1 1")
     dA = dt * rearrange(A, "h -> h 1 1")
     dA_cumsum = torch.cumsum(dA, dim=-1)

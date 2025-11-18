@@ -25,7 +25,7 @@ dependencies = [
     "setuptools>=61.0.0",
 ]
 [project.urls]
-Repository = "https://github.com/state-spaces/mamba"
+Repository = "https://github.com/AudioTechnicaKamijiSota/mamba"
 
 [project.optional-dependencies]
 causal-conv1d = [
