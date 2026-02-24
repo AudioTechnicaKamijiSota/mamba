@@ -297,7 +297,7 @@ class Mamba2(nn.Module, PyTorchModelHubMixin):
                 rearrange(C, "b l (g n) -> b l g n", g=self.ngroups),
                 chunk_size=self.chunk_size,
                 D=rearrange(self.D, "(h p) -> h p", p=self.headdim) if self.D_has_hdim else self.D,
-                z=rearrange(z, "b l (h p) -> b l h p", p=self.headdim) if not self.normalize else None,
+                z=rearrange(z, "b l (h p) -> b l h p", p=self.headdim) if not self.normalize else None, # gate inside if not use normalize
                 dt_bias=self.dt_bias,
                 dt_softplus=self.dt_softplus,
                 seq_idx=seq_idx,
@@ -316,8 +316,6 @@ class Mamba2(nn.Module, PyTorchModelHubMixin):
             y = rearrange(y, "b l h p -> b l (h p)")
             if self.normalize:
                 y = self.norm(y, z)
-            else: # gate only
-                y = y * self.act(z)
             if d_mlp > 0:
                 y = torch.cat([self.act(z0) * x0, y], dim=-1)
             if seqlen_og is not None:
