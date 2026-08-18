@@ -75,6 +75,8 @@ def _chunk_cumsum_fwd_kernel(
         dt += dt_bias[:, None]
     if DT_SOFTPLUS:
         dt = tl.where(dt <= 20.0, softplus(dt), dt)
+    else:
+        dt = tl.maximum(dt, 0.0) + 1e-4  # fork: relu + 床 (quant_friendly.DT_FLOOR と一致)
     # As of Triton 2.2.0, tl.clamp is not available yet
     # dt = tl.clamp(dt, dt_min, dt_max)
     dt = tl.minimum(tl.maximum(dt, dt_min), dt_max)
@@ -149,6 +151,9 @@ def _chunk_cumsum_bwd_kernel(
     if DT_SOFTPLUS:
         dt_presoftplus = dt
         dt = tl.where(dt <= 20.0, softplus(dt), dt)
+    else:
+        dt_prerelu = dt  # fork: relu の勾配マスク用に活性化前を保持
+        dt = tl.maximum(dt, 0.0) + 1e-4  # fork: relu + 床 (quant_friendly.DT_FLOOR と一致)
     clamp_mask = (dt < dt_min) | (dt > dt_max)
     # As of Triton 2.2.0, tl.clamp is not available yet
     # dt = tl.clamp(dt, dt_min, dt_max)
@@ -158,6 +163,8 @@ def _chunk_cumsum_bwd_kernel(
     ddt = tl.where(clamp_mask, 0.0, ddt)
     if DT_SOFTPLUS:
         ddt = tl.where(dt_presoftplus <= 20.0, ddt * tl.sigmoid(dt_presoftplus), ddt)
+    else:
+        ddt = tl.where(dt_prerelu > 0.0, ddt, 0.0)  # fork: relu の勾配
     tl.store(ddt_ptrs, ddt, mask=(offs_h[:, None] < nheads) & (offs_c[None, :] < chunk_size_limit))
     dA = tl.sum(ddA * dt, axis=1)
     dA_ptr += pid_b * stride_dA_batch + pid_c * stride_dA_chunk

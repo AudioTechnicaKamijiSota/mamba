@@ -25,6 +25,11 @@ except ImportError:
 
 from mamba_ssm.ops.triton.layernorm_gated import RMSNorm as RMSNormGated
 
+# ---- fork 追加: 量子化しやすい正規化 / dt 活性化（本体は quant_friendly.py 側）----
+from mamba_ssm.ops.triton.layernorm_gated import LayerNorm as LayerNormGated
+from mamba_ssm.modules.quant_friendly import DyTGated, dt_activation
+# ------------------------------------------------------------------------------
+
 from mamba_ssm.distributed.tensor_parallel import ColumnParallelLinear, RowParallelLinear
 from mamba_ssm.distributed.distributed_utils import all_reduce, reduce_scatter
 
@@ -48,6 +53,12 @@ class Mamba2(nn.Module, PyTorchModelHubMixin):
         A_init_range=(1, 16),
         D_has_hdim=False,
         rmsnorm=True,
+        # ---- fork 追加。既定値は upstream と完全に同じ挙動になるようにしてある ----
+        normalize=None,           # rmsnorm の別名（既存プロジェクトはこの名前で渡す）
+        norm_function="RMSNorm",  # "DyTGated" / "LayerNorm" / "RMSNorm"
+        norm_eps=1e-5,            # DyTGated 以外の norm の eps
+        softplus_to_relu=False,   # True で dt の softplus を ReLU + 下限クリップに置換
+        # ---------------------------------------------------------------------
         norm_before_gate=False,
         dt_min=0.001,
         dt_max=0.1,
@@ -84,7 +95,11 @@ class Mamba2(nn.Module, PyTorchModelHubMixin):
         assert self.d_ssm % self.headdim == 0
         self.nheads = self.d_ssm // self.headdim
         self.D_has_hdim = D_has_hdim
-        self.rmsnorm = rmsnorm
+        self.rmsnorm = rmsnorm if normalize is None else normalize
+        # ---- fork 追加 ----
+        self.norm_function = norm_function
+        self.dt_softplus = not softplus_to_relu
+        # -------------------
         self.norm_before_gate = norm_before_gate
         self.dt_limit = dt_limit
         self.activation = "silu"
@@ -139,7 +154,15 @@ class Mamba2(nn.Module, PyTorchModelHubMixin):
         self.D = nn.Parameter(torch.ones(self.d_ssm if self.D_has_hdim else self.nheads, device=device))
         self.D._no_weight_decay = True
 
-        if self.rmsnorm:
+        # ---- fork 追加: norm_function で正規化を差し替える（下の elif が upstream 既定）----
+        if self.rmsnorm and norm_function == "DyTGated":
+            self.norm = DyTGated(self.d_ssm, **factory_kwargs)
+        elif self.rmsnorm and norm_function == "LayerNorm":
+            assert LayerNormGated is not None
+            self.norm = LayerNormGated(self.d_ssm, eps=norm_eps, norm_before_gate=self.norm_before_gate,
+                                       group_size=self.d_ssm // ngroups, **factory_kwargs)
+        # -----------------------------------------------------------------------------
+        elif self.rmsnorm:
             assert RMSNormGated is not None
             self.norm = RMSNormGated(self.d_ssm, eps=1e-5, norm_before_gate=self.norm_before_gate,
                                      group_size=self.d_ssm // ngroups, **factory_kwargs)
@@ -181,7 +204,11 @@ class Mamba2(nn.Module, PyTorchModelHubMixin):
         # If the model is loaded in fp16, without the .float() here, A might be -inf
         A = -torch.exp(self.A_log.float())  # (nheads) or (d_inner, d_state)
         dt_limit_kwargs = {} if self.dt_limit == (0.0, float("inf")) else dict(dt_limit=self.dt_limit)
-        if self.use_mem_eff_path and inference_params is None:
+        # ★fork: 融合カーネル (mamba_split_conv1d_scan_combined) は RMSNorm と softplus が
+        #   ハードコードされているため、norm や dt 活性化を差し替えたときは使えない。
+        #   ★分岐を削除せず条件で無効化する（上流の forward への変更と競合させないため）。
+        if (self.use_mem_eff_path and inference_params is None
+                and self.dt_softplus and self.norm_function == "RMSNorm"):
             out = mamba_split_conv1d_scan_combined(
                 zxbcdt,
                 rearrange(self.conv1d.weight, "d 1 w -> d w"),
@@ -251,7 +278,7 @@ class Mamba2(nn.Module, PyTorchModelHubMixin):
                 D=rearrange(self.D, "(h p) -> h p", p=self.headdim) if self.D_has_hdim else self.D,
                 z=rearrange(z, "b l (h p) -> b l h p", p=self.headdim) if not self.rmsnorm else None,
                 dt_bias=self.dt_bias,
-                dt_softplus=True,
+                dt_softplus=self.dt_softplus,  # fork: False で relu + 1e-4 になる
                 seq_idx=seq_idx,
                 cu_seqlens=cu_seqlens,
                 **dt_limit_kwargs,
@@ -310,7 +337,8 @@ class Mamba2(nn.Module, PyTorchModelHubMixin):
         if selective_state_update is None:
             assert self.ngroups == 1, "Only support ngroups=1 for this inference code path"
             # Discretize A and B
-            dt = F.softplus(dt + self.dt_bias.to(dtype=dt.dtype))  # (batch, nheads)
+            # fork: softplus_to_relu=True なら relu(dt) + 1e-4（quant_friendly.py 側に実装）
+            dt = dt_activation(dt + self.dt_bias.to(dtype=dt.dtype), self.dt_softplus)  # (batch, nheads)
             dA = torch.exp(dt * A)  # (batch, nheads)
             x = rearrange(x, "b (h p) -> b h p", p=self.headdim)
             dBx = torch.einsum("bh,bn,bhp->bhpn", dt, B, x)
@@ -332,7 +360,7 @@ class Mamba2(nn.Module, PyTorchModelHubMixin):
                 z = rearrange(z, "b (h p) -> b h p", p=self.headdim)
             y = selective_state_update(
                 ssm_state, x_reshaped, dt, A, B, C, D, z=z if not self.rmsnorm else None,
-                dt_bias=dt_bias, dt_softplus=True
+                dt_bias=dt_bias, dt_softplus=self.dt_softplus  # fork: False で relu + 1e-4
             )
             y = rearrange(y, "b h p -> b (h p)")
         if self.rmsnorm:
