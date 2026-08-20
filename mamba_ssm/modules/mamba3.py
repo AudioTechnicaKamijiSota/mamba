@@ -9,6 +9,10 @@ import torch.nn.functional as F
 
 from mamba_ssm.ops.triton.layernorm_gated import RMSNorm as RMSNormGated
 
+# ---- fork 追加 ----
+from mamba_ssm.modules.quant_friendly import build_norm
+# -------------------
+
 try:
     from mamba_ssm.ops.tilelang.mamba3.mamba3_mimo import mamba3_mimo as mamba3_mimo_combined
 except ImportError:
@@ -59,6 +63,10 @@ class Mamba3(nn.Module):
         is_mimo=False,
         mimo_rank=4,
         fuse_pregate_headwise_norm=True,
+        # ---- fork 追加。既定値は upstream と完全に同じ挙動になるようにしてある ----
+        norm_function="RMSNorm",  # "RMSNorm"（上流）/ "DyT" / "DyTGated"（後 2 つは同義）
+        norm_eps=1e-5,            # norm の eps。上流は 1e-5 をリテラルで持っている
+        # ---------------------------------------------------------------------
         #-------------------------------------------
         # Fused kernel and sharding options
         chunk_size=64, # Recommended: 64 for SISO, 64/mimo_rank for MIMO
@@ -81,8 +89,13 @@ class Mamba3(nn.Module):
         self.is_outproj_norm=is_outproj_norm
         self.is_mimo = is_mimo
         self.mimo_rank = mimo_rank
+        self.norm_function = norm_function  # fork 追加
+        # ★fork 追加の条件 `norm_function == "RMSNorm"`: MIMO の fused headwise norm は
+        #   カーネル内の rsqrt なので DyT では使えない。DyT のときは強制 False にして
+        #   非 fused 経路（_postprocess / mamba3_step.py の outproj_norm）へ落とす（数学は同じ）。
         self.fuse_pregate_headwise_norm = bool(
             fuse_pregate_headwise_norm and self.is_mimo and self.is_outproj_norm
+            and norm_function == "RMSNorm"
         )
         if not self.is_mimo:
             self.mimo_rank = 1
@@ -123,8 +136,8 @@ class Mamba3(nn.Module):
                                                        
         # RMS Norm for B and C
         assert RMSNormGated is not None
-        self.B_norm = RMSNormGated(self.d_state, eps=1e-5, **factory_kwargs)
-        self.C_norm = RMSNormGated(self.d_state, eps=1e-5, **factory_kwargs)
+        self.B_norm = build_norm(norm_function, self.d_state, eps=norm_eps, **factory_kwargs)
+        self.C_norm = build_norm(norm_function, self.d_state, eps=norm_eps, **factory_kwargs)
 
         if self.is_mimo:
             # Initialize up/down MIMO projection (for x and z)
@@ -141,9 +154,11 @@ class Mamba3(nn.Module):
         self.D._no_weight_decay = True
 
         if self.is_outproj_norm:
-            self.norm = RMSNormGated(
+            self.norm = build_norm(
+                norm_function,
                 self.d_inner,
-                eps=1e-5,
+                eps=norm_eps,
+                gated=True,
                 norm_before_gate=True,
                 group_size=self.headdim,
                 **factory_kwargs

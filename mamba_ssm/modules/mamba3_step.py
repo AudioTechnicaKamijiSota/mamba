@@ -33,6 +33,7 @@ import torch.nn.functional as F
 from einops import rearrange
 
 from mamba_ssm.modules.mamba3 import Mamba3, heavy_tail_activation
+from mamba_ssm.modules.quant_friendly import DyT, DyTGated
 
 # 上流が書いた純 PyTorch の RMSNorm。RMSNormGated.forward は triton なので呼べないが、
 # 数学はこれと同じ（同じファイルの rmsnorm_fn がこれの triton 版）。自前で書き直さない。
@@ -41,12 +42,18 @@ from mamba_ssm.ops.triton.layernorm_gated import rms_norm_ref
 TWO_PI = 2 * math.pi
 
 
-def rms_norm_module(x, norm):
-    """``RMSNormGated`` モジュール ``norm`` を、その構築引数のまま純 PyTorch で適用する。
+def apply_norm(x, norm):
+    """非ゲートの norm モジュールを純 PyTorch で適用する（``norm_function`` に対応）。
 
-    ``RMSNormGated`` は ``weight`` のみを持ち ``bias`` は ``None`` 登録である
-    (``ops/triton/layernorm_gated.py`` の ``RMSNorm.__init__``)。
+    ★これは**型（アーキテクチャ）による分岐**で、実行環境による分岐ではない。
+
+    * ``DyT`` は純 PyTorch なので**そのまま呼ぶ**
+    * ``RMSNormGated`` は ``forward`` が triton なので呼べない。**構築引数だけ読んで**
+      上流の純 PyTorch 実装 ``rms_norm_ref`` に渡す。``RMSNormGated`` は ``weight`` のみを持ち
+      ``bias`` は ``None`` 登録（``ops/triton/layernorm_gated.py`` の ``RMSNorm.__init__``）
     """
+    if isinstance(norm, DyT):
+        return norm(x)
     return rms_norm_ref(
         x,
         norm.weight,
@@ -57,8 +64,10 @@ def rms_norm_module(x, norm):
     )
 
 
-def rms_norm_gated_module(x, z, norm):
-    """ゲート付き。``norm_before_gate=True`` なら ``norm(x) * silu(z)``。"""
+def apply_norm_gated(x, z, norm):
+    """ゲート付き。``norm_before_gate=True`` なら ``norm(x) * silu(z)``（正規化 → ゲート）。"""
+    if isinstance(norm, DyTGated):
+        return norm(x, z)
     return rms_norm_ref(
         x,
         norm.weight,
@@ -203,7 +212,7 @@ def mamba3_recurrence_step(
         z_proj = torch.einsum("bhp,rhp->brhp", z.float(), zpj)
         z_proj = rearrange(z_proj, "b r h p -> b r (h p)")
         y = rearrange(y, "b r h p -> b r (h p)").float()
-        y = rms_norm_gated_module(y, z_proj, outproj_norm)
+        y = apply_norm_gated(y, z_proj, outproj_norm)
         y = rearrange(y, "b r (h p) -> b r h p", p=headdim)
         y = torch.einsum("brhp,rhp->bhp", y, outpj)
 
@@ -277,8 +286,8 @@ class Mamba3_Step(Mamba3):
 
         B = rearrange(B, "b (r g n) -> b r g n", r=self.mimo_rank, g=self.num_bc_heads)
         C = rearrange(C, "b (r g n) -> b r g n", r=self.mimo_rank, g=self.num_bc_heads)
-        B = rms_norm_module(B, self.B_norm)
-        C = rms_norm_module(C, self.C_norm)
+        B = apply_norm(B, self.B_norm)
+        C = apply_norm(C, self.C_norm)
         # ngroups=1 では B/C は全ヘッド共有。ヘッド差は B_bias / C_bias のみ。
         B = B.expand(-1, -1, self.nheads, -1)
         C = C.expand(-1, -1, self.nheads, -1)
