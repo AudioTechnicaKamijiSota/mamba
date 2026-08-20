@@ -18,7 +18,11 @@ classifiers = [
 dependencies = [
     "torch",
     "tilelang==0.1.8",
-    "apache-tvm-ffi<=0.1.12",
+    # 0.1.12: tilelang 0.1.8 同梱の tvm を import できない
+    #         (AttributeError: attribute '__dict__' of 'type' objects is not writable)
+    # 0.1.10/0.1.11: import は通るが MIMO の tilelang JIT が落ちる
+    #         (AttributeError: '_NestedLoopCheckVisitor' object has no attribute '_inst')
+    "apache-tvm-ffi==0.1.9",
     "quack-kernels>=0.3.4",
     "triton>=3.5.0",
     "ninja",
