@@ -190,3 +190,71 @@ def dt_activation(dt, dt_softplus, dt_floor=DT_FLOOR):
     if dt_softplus:
         return F.softplus(dt)
     return F.relu(dt) + dt_floor
+
+
+# ---------------------------------------------------------------------------
+# Mamba-3 の dt パラメータ化（``dt_transform``）
+#
+# ★順変換と逆変換を必ず**対で**ここに置くこと。「順変換と逆変換の取り違え」が
+#   この機能の唯一のバグ class であり、離れた場所に書くと必ず食い違う。
+#   互いの逆であることは verify/verify_mamba3_dt.py が数値で検査する。
+#
+# ★論文の仕様は「``dt_bias`` の値」ではなく「**活性化後の Δ の範囲**」で決まっている
+#   （Mamba 論文: Δ は ``τ_Δ⁻¹(Uniform([dt_min, dt_max]))`` で初期化。``τ_Δ`` は使う活性化）。
+#   したがって ``inv_dt_transform`` は「その活性化の逆関数を当てているだけ」で、
+#   inverse-softplus は softplus 固有の仕様ではない。
+#
+# ★Mamba-2 用の ``dt_activation``（上）とは**意図的に分けている**。
+#   Mamba-2 は softplus/relu の切り替えで、カーネル側（ssd_combined.py の ``dt_softplus``）にも
+#   同じ分岐が入っている。Mamba-3 のカーネルは dt に活性化を当てないので事情が違う。
+#   softplus の記述が 2 箇所に出る軽い重複は、**Mamba-2 の bit 一致を守る対価**として受け入れる。
+# ---------------------------------------------------------------------------
+
+DT_TRANSFORMS = ("softplus", "exp")
+
+
+def _check_dt_transform(dt_transform):
+    if dt_transform in DT_TRANSFORMS:
+        return
+    if dt_transform == "relu":
+        raise ValueError(
+            "dt_transform='relu' is not supported for Mamba-3. In Mamba-3, Δ also scales the "
+            "rotation angle (Δθ = π·tanh(angle)·Δ), so losing softplus's multiplicative "
+            "compression is not acceptable: the local gain ratio (dΔ/du)/Δ becomes 1/Δ "
+            "(100 at Δ=0.01, 1000 at Δ=0.001) instead of ~1, which spreads Δ over 4.25 decades "
+            "and pushes ~30% of Δ above 1/π = 0.318 where the deploy-side Taylor cos/sin breaks. "
+            "Mamba-2 uses relu (see dt_activation) because it has no rotation path."
+        )
+    raise ValueError(
+        f"Unknown dt_transform {dt_transform!r}. Expected one of {DT_TRANSFORMS}."
+    )
+
+
+def apply_dt_transform(x, dt_transform):
+    """事前活性化 ``x = dd_dt + dt_bias`` から Δ を作る（順変換 ``τ_Δ``）。
+
+    * ``"softplus"``: 上流の既定。``F.softplus(x)``
+    * ``"exp"``: ``torch.exp(x)``。**Vela は SOFTPLUS/LOG 非対応だが EXP は int8/int16 で対応**。
+      softplus が動作域で担っていた**乗法的圧縮**を保ち（局所ゲイン比が厳密に 1）、
+      正値性は softplus より強く厳密に > 0（下限クリップ不要）。
+      仕様帯 Δ∈[0.001, 0.1] では softplus との差が 0.05〜5% しかない
+    """
+    _check_dt_transform(dt_transform)
+    if dt_transform == "softplus":
+        return F.softplus(x)
+    return torch.exp(x)
+
+
+def inv_dt_transform(dt, dt_transform):
+    """Δ から事前活性化を逆算する（逆変換 ``τ_Δ⁻¹``）。``dt_bias`` の初期化に使う。
+
+    ``apply_dt_transform(inv_dt_transform(dt, t), t) == dt`` が成り立つこと（検証済み）。
+
+    * ``"softplus"``: ``dt + log(-expm1(-dt))``。★上流 ``mamba3.py`` の式と同一
+    * ``"exp"``: ``log(dt)``。★対数一様初期化は元々 exp 用に書かれている
+      （``_dt = exp(U·(log dt_max − log dt_min) + log dt_min)`` なので ``log(_dt)`` は指数部そのもの）
+    """
+    _check_dt_transform(dt_transform)
+    if dt_transform == "softplus":
+        return dt + torch.log(-torch.expm1(-dt))
+    return torch.log(dt)

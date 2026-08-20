@@ -10,7 +10,7 @@ import torch.nn.functional as F
 from mamba_ssm.ops.triton.layernorm_gated import RMSNorm as RMSNormGated
 
 # ---- fork 追加 ----
-from mamba_ssm.modules.quant_friendly import build_norm
+from mamba_ssm.modules.quant_friendly import build_norm, apply_dt_transform, inv_dt_transform
 # -------------------
 
 try:
@@ -66,6 +66,7 @@ class Mamba3(nn.Module):
         # ---- fork 追加。既定値は upstream と完全に同じ挙動になるようにしてある ----
         norm_function="RMSNorm",  # "RMSNorm"（上流）/ "DyT" / "DyTGated"（後 2 つは同義）
         norm_eps=1e-5,            # norm の eps。上流は 1e-5 をリテラルで持っている
+        dt_transform="softplus",  # "softplus"（上流）/ "exp"。Δ の活性化 τ_Δ
         # ---------------------------------------------------------------------
         #-------------------------------------------
         # Fused kernel and sharding options
@@ -90,6 +91,7 @@ class Mamba3(nn.Module):
         self.is_mimo = is_mimo
         self.mimo_rank = mimo_rank
         self.norm_function = norm_function  # fork 追加
+        self.dt_transform = dt_transform    # fork 追加（mamba3_step.py が読む）
         # ★fork 追加の条件 `norm_function == "RMSNorm"`: MIMO の fused headwise norm は
         #   カーネル内の rsqrt なので DyT では使えない。DyT のときは強制 False にして
         #   非 fused 経路（_postprocess / mamba3_step.py の outproj_norm）へ落とす（数学は同じ）。
@@ -126,7 +128,9 @@ class Mamba3(nn.Module):
             + math.log(dt_min)
         )
         _dt = torch.clamp(_dt, min=dt_init_floor)
-        _dt_bias = _dt + torch.log(-torch.expm1(-_dt))
+        # fork: 逆変換を dt_transform で切り替える。"softplus" は上流と同一式。
+        # ★仕様は「活性化後の Δ が [dt_min, dt_max] の対数一様」であること。bias の値ではない。
+        _dt_bias = inv_dt_transform(_dt, dt_transform)
         self.dt_bias = nn.Parameter(_dt_bias, requires_grad=True)
         self.dt_bias._no_weight_decay = True
         
@@ -208,7 +212,7 @@ class Mamba3(nn.Module):
         # Compute ADT, DT
         _A = -heavy_tail_activation(dd_A.to(torch.float32)) # (B, L, N)
         _A = torch.clamp(_A, max=-self.A_floor)            
-        DT = F.softplus(dd_dt + self.dt_bias) # (B, L, N)
+        DT = apply_dt_transform(dd_dt + self.dt_bias, self.dt_transform) # (B, L, N)
         ADT = _A * DT
         DT = rearrange(DT, "b l n -> b n l")
         ADT = rearrange(ADT, "b l n -> b n l")
@@ -296,7 +300,7 @@ class Mamba3(nn.Module):
     def _preprocess(self, A_proj, dd_dt, B, C, x, z, trap_proj, angle_proj):
         _A = -heavy_tail_activation(A_proj.to(torch.float32))
         _A = torch.clamp(_A, max=-self.A_floor)
-        DT = F.softplus(dd_dt + self.dt_bias)
+        DT = apply_dt_transform(dd_dt + self.dt_bias, self.dt_transform)
         trap = torch.sigmoid(trap_proj)
 
         rank = self.mimo_rank if self.is_mimo else 1
