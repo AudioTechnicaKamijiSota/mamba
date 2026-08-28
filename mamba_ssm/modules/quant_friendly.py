@@ -44,6 +44,8 @@
   （Mamba-2 側の既存 ``DyTGated`` が bias を持っているため、後方互換のために残してある）。
 """
 
+import math
+
 import torch
 import torch.nn.functional as F
 
@@ -258,3 +260,51 @@ def inv_dt_transform(dt, dt_transform):
     if dt_transform == "softplus":
         return dt + torch.log(-torch.expm1(-dt))
     return torch.log(dt)
+
+
+# ---------------------------------------------------------------------------
+# Δ の上限（``dt_limit``）
+#
+# ★なぜ要るか: Mamba-3 では Δ が**回転角にも掛かる**（``Δθ = π·tanh(angle)·Δ``）。
+#   デプロイ側は COS/SIN が無く Taylor 多項式で cos/sin を作るので定義域は |Δθ| <= 1 rad。
+#   ``π·tanh`` で角度側は ±π に有界なので **Δ <= 1/π を保証すれば足りる**。
+#   累積角 Θ の 360° 超えは問題ない（trig_state 設計ではラップアラウンドが原理的に不要）。
+#   厳密なのは 1 step の Δθ だけ。
+#
+# ★引数名・形は**上流 Mamba-2 の ``dt_limit=(0.0, float("inf"))`` と同じ**。新しい名前を発明しない。
+#
+# ★hard clamp を採った理由（2026-08-21、3 候補を実測して決定）:
+#   * 仕様帯 [0.001, 0.1] で**厳密に恒等** ＝ ``dt_transform`` の結論（Δ の分布・初期化仕様・
+#     乗法的圧縮）を bit 単位で保存する。初期化の逆変換も変更不要（``log Δ₀`` のまま）
+#   * 到達可能域の局所ゲイン比が**厳密に 1.0**（tanh 版は Δ=0.3 で 0.21、σ 版は 0.06 まで落ちる）
+#   * 唯一の短所「上限域で勾配が 0」は **上流 Mamba-2 が既に採用・出荷している挙動**
+#     （``ops/triton/ssd_chunk_state.py`` の ``clamp_mask`` → ``ddt = tl.where(clamp_mask, 0.0, ddt)``
+#     が ``torch.clamp`` と同じ勾配）。Δmax=1/π では**該当が 0.195% だけ**
+#   * デプロイ側は ``Δmax − relu(Δmax − Δ)`` で書ける（RELU は前段の fused activation に
+#     畳まれるので SUB 1 個ぶんの追加で済む）。★この relu の綴りは **TF 側の仕事**であり、
+#     PyTorch 側は ``torch.clamp`` と書く（実機モデルが ``torch.clamp`` を
+#     ``relu(x + 16.0) - 16.0`` として書いているのと同じ関係）
+# ---------------------------------------------------------------------------
+
+#: Taylor cos/sin の定義域 |Δθ| <= 1 rad から出る Δ の上限。``Δθ = π·tanh(angle)·Δ`` で
+#: 角度側が ±π に有界なので、``Δ <= 1/π`` なら |Δθ| <= 1 rad が保証される。
+DT_MAX_TAYLOR = 1.0 / math.pi  # 0.3183...
+
+NO_DT_LIMIT = (0.0, float("inf"))
+
+
+def apply_dt_limit(dt, dt_limit=NO_DT_LIMIT):
+    """Δ に上下限を掛ける。上流 Mamba-2 の ``dt_limit`` と同じ数学・同じ勾配（hard clamp）。
+
+    ★既定 ``(0.0, inf)`` は**恒等**（早期 return するので bit 単位で無変更）。
+    上流一致テストの錨を守るため、既定で 1 bit も変えないことが重要。
+
+    Args:
+        dt: 活性化後の Δ（``apply_dt_transform`` の出力）
+        dt_limit: ``(dt_min, dt_max)``。``Δ <= 1/π`` を保証したいなら
+            ``(0.0, DT_MAX_TAYLOR)`` を渡す
+    """
+    dt_min, dt_max = dt_limit
+    if dt_min <= 0.0 and dt_max == float("inf"):
+        return dt
+    return dt.clamp(min=dt_min, max=dt_max)

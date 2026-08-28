@@ -33,7 +33,7 @@ import torch.nn.functional as F
 from einops import rearrange
 
 from mamba_ssm.modules.mamba3 import Mamba3, heavy_tail_activation
-from mamba_ssm.modules.quant_friendly import DyT, DyTGated, apply_dt_transform
+from mamba_ssm.modules.quant_friendly import DyT, DyTGated, apply_dt_transform, apply_dt_limit
 
 # 上流が書いた純 PyTorch の RMSNorm。RMSNormGated.forward は triton なので呼べないが、
 # 数学はこれと同じ（同じファイルの rmsnorm_fn がこれの triton 版）。自前で書き直さない。
@@ -280,7 +280,9 @@ class Mamba3_Step(Mamba3):
 
         _A = -heavy_tail_activation(dd_A.to(torch.float32))
         _A = torch.clamp(_A, max=-self.A_floor)
-        dt = apply_dt_transform(dd_dt + self.dt_bias, self.dt_transform)
+        # ★上限は adt を作る前に掛ける（減衰 α と回転角 Δθ の両方がクランプ後の Δ を見る）
+        dt = apply_dt_limit(
+            apply_dt_transform(dd_dt + self.dt_bias, self.dt_transform), self.dt_limit)
         adt = _A * dt
         trap = torch.sigmoid(trap)
 

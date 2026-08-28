@@ -10,7 +10,9 @@ import torch.nn.functional as F
 from mamba_ssm.ops.triton.layernorm_gated import RMSNorm as RMSNormGated
 
 # ---- fork 追加 ----
-from mamba_ssm.modules.quant_friendly import build_norm, apply_dt_transform, inv_dt_transform
+from mamba_ssm.modules.quant_friendly import (
+    build_norm, apply_dt_transform, inv_dt_transform, apply_dt_limit, NO_DT_LIMIT,
+)
 # -------------------
 
 try:
@@ -67,6 +69,8 @@ class Mamba3(nn.Module):
         norm_function="RMSNorm",  # "RMSNorm"（上流）/ "DyT" / "DyTGated"（後 2 つは同義）
         norm_eps=1e-5,            # norm の eps。上流は 1e-5 をリテラルで持っている
         dt_transform="softplus",  # "softplus"（上流）/ "exp"。Δ の活性化 τ_Δ
+        dt_limit=NO_DT_LIMIT,     # (Δmin, Δmax)。上流 Mamba-2 と同名・同形。既定は上限なし
+                                  # ★Δθ <= 1 rad を保証したいなら (0.0, DT_MAX_TAYLOR)
         # ---------------------------------------------------------------------
         #-------------------------------------------
         # Fused kernel and sharding options
@@ -92,6 +96,7 @@ class Mamba3(nn.Module):
         self.mimo_rank = mimo_rank
         self.norm_function = norm_function  # fork 追加
         self.dt_transform = dt_transform    # fork 追加（mamba3_step.py が読む）
+        self.dt_limit = dt_limit            # fork 追加（同上）
         # ★fork 追加の条件 `norm_function == "RMSNorm"`: MIMO の fused headwise norm は
         #   カーネル内の rsqrt なので DyT では使えない。DyT のときは強制 False にして
         #   非 fused 経路（_postprocess / mamba3_step.py の outproj_norm）へ落とす（数学は同じ）。
@@ -212,7 +217,9 @@ class Mamba3(nn.Module):
         # Compute ADT, DT
         _A = -heavy_tail_activation(dd_A.to(torch.float32)) # (B, L, N)
         _A = torch.clamp(_A, max=-self.A_floor)            
-        DT = apply_dt_transform(dd_dt + self.dt_bias, self.dt_transform) # (B, L, N)
+        # ★上限は ADT を作る前に掛ける（減衰 α と回転角 Δθ の両方がクランプ後の Δ を見る）
+        DT = apply_dt_limit(
+            apply_dt_transform(dd_dt + self.dt_bias, self.dt_transform), self.dt_limit) # (B, L, N)
         ADT = _A * DT
         DT = rearrange(DT, "b l n -> b n l")
         ADT = rearrange(ADT, "b l n -> b n l")
@@ -300,7 +307,8 @@ class Mamba3(nn.Module):
     def _preprocess(self, A_proj, dd_dt, B, C, x, z, trap_proj, angle_proj):
         _A = -heavy_tail_activation(A_proj.to(torch.float32))
         _A = torch.clamp(_A, max=-self.A_floor)
-        DT = apply_dt_transform(dd_dt + self.dt_bias, self.dt_transform)
+        DT = apply_dt_limit(
+            apply_dt_transform(dd_dt + self.dt_bias, self.dt_transform), self.dt_limit)
         trap = torch.sigmoid(trap_proj)
 
         rank = self.mimo_rank if self.is_mimo else 1
