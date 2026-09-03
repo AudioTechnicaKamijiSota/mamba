@@ -27,7 +27,7 @@ from mamba_ssm.ops.triton.layernorm_gated import RMSNorm as RMSNormGated
 
 # ---- fork 追加: 量子化しやすい正規化 / dt 活性化（本体は quant_friendly.py 側）----
 from mamba_ssm.ops.triton.layernorm_gated import LayerNorm as LayerNormGated
-from mamba_ssm.modules.quant_friendly import DyTGated, dt_activation
+from mamba_ssm.modules.quant_friendly import DyTGated, dt_activation, apply_A_floor
 # ------------------------------------------------------------------------------
 
 from mamba_ssm.distributed.tensor_parallel import ColumnParallelLinear, RowParallelLinear
@@ -58,6 +58,7 @@ class Mamba2(nn.Module, PyTorchModelHubMixin):
         norm_function="RMSNorm",  # "DyTGated" / "LayerNorm" / "RMSNorm"
         norm_eps=1e-5,            # DyTGated 以外の norm の eps
         softplus_to_relu=False,   # True で dt の softplus を ReLU + 下限クリップに置換
+        A_floor=0.0,              # |A| の下限。>0 で A = -(A_floor + exp(A_log))
         # ---------------------------------------------------------------------
         norm_before_gate=False,
         dt_min=0.001,
@@ -99,6 +100,7 @@ class Mamba2(nn.Module, PyTorchModelHubMixin):
         # ---- fork 追加 ----
         self.norm_function = norm_function
         self.dt_softplus = not softplus_to_relu
+        self.A_floor = A_floor
         # -------------------
         self.norm_before_gate = norm_before_gate
         self.dt_limit = dt_limit
@@ -202,7 +204,7 @@ class Mamba2(nn.Module, PyTorchModelHubMixin):
         if seqlen_og is not None:
             zxbcdt = rearrange(zxbcdt, "(b l) d -> b l d", l=seqlen)
         # If the model is loaded in fp16, without the .float() here, A might be -inf
-        A = -torch.exp(self.A_log.float())  # (nheads) or (d_inner, d_state)
+        A = apply_A_floor(self.A_log.float(), self.A_floor)  # (nheads) or (d_inner, d_state)
         dt_limit_kwargs = {} if self.dt_limit == (0.0, float("inf")) else dict(dt_limit=self.dt_limit)
         # ★fork: 融合カーネル (mamba_split_conv1d_scan_combined) は RMSNorm と softplus が
         #   ハードコードされているため、norm や dt 活性化を差し替えたときは使えない。
@@ -331,7 +333,7 @@ class Mamba2(nn.Module, PyTorchModelHubMixin):
             )
 
         x, B, C = torch.split(xBC, [self.d_ssm, self.ngroups * self.d_state, self.ngroups * self.d_state], dim=-1)
-        A = -torch.exp(self.A_log.float())  # (nheads,)
+        A = apply_A_floor(self.A_log.float(), self.A_floor)  # (nheads,)
 
         # SSM step
         if selective_state_update is None:

@@ -308,3 +308,59 @@ def apply_dt_limit(dt, dt_limit=NO_DT_LIMIT):
     if dt_min <= 0.0 and dt_max == float("inf"):
         return dt
     return dt.clamp(min=dt_min, max=dt_max)
+
+
+# ---------------------------------------------------------------------------
+# Mamba-2 の A の下限（``A_floor``）
+#
+# ★上流は ``A = -exp(A_log)`` なので |A| に下限が無く、学習で ``A_log -> -inf`` に
+#   落ちると ``dA = exp(dt·A) -> 1`` になる（減衰が消える）。
+#
+# ★★**なぜ dt ではなく A に下限を置くのか**:
+#   このフォークの Mamba-2 は ``softplus_to_relu=True`` のとき
+#   ``dt_act = relu(dt + dt_bias) + DT_FLOOR`` で **dt に構造的な下限 1e-4** がある
+#   （``dt_activation`` / ``ssd_chunk_state.py`` / ``ssd_combined.py`` の 3 経路すべて）。
+#   したがって |A| に下限を置くだけで **dA の上界が構成として確定する**:
+#
+#       dA = exp(-dt_act·|A|) <= exp(-DT_FLOOR · A_floor)
+#
+#   | A_floor | 保証される dA の上限 |
+#   |---------|---------------------|
+#   | 100.5   | 0.99                |
+#   | 202     | 0.98                |
+#   | 513     | 0.95                |
+#
+#   ★これが効くのは、状態が毎フレーム丸められその誤差が極の近さに応じて積み上がる
+#   （蓄積利得 ``1/(1-dA²)``）ため。dA <= 0.99 で上限が 17.0 dB に固定される。
+#   ★逆に **dt に一律の下限**を置くと、|A| が大きいヘッドが ``dA = exp(-21) ~ 0`` になり
+#   **既に記憶が短くて無害なヘッドの再帰を壊す**。A 側に置くのが形として正しい。
+#
+# ★★**保証が成立する条件**: ``softplus_to_relu=True``。既定の softplus 経路には
+#   dt の床が無い（``softplus(dt) -> 0``）ので、上界は成立しない。
+#
+# ★clamp ではなく**再パラメータ化**を使う。Mamba-3 の ``A_floor`` は A が
+#   データ依存の活性化なので ``clamp(_A, max=-A_floor)`` しか選べず上限域で勾配が死ぬが、
+#   Mamba-2 の A は学習パラメータなので ``-(A_floor + exp(A_log))`` と書けて
+#   **全域で滑らか・勾配が死なない**。
+#
+# ★初期化は変更しない。``A_floor`` は ``A_init_range`` より桁で大きいのが普通なので
+#   （既定 ``(1, 16)`` に対し 100.5）、逆変換 ``log(|A| - A_floor)`` は成立しない。
+#   ``A_init_range`` は「**床からの上乗せ幅**」と解釈する（|A| = A_floor + U(A_init_range)）。
+# ---------------------------------------------------------------------------
+
+A_NO_FLOOR = 0.0
+
+
+def apply_A_floor(A_log, A_floor=A_NO_FLOOR):
+    """``A = -(A_floor + exp(A_log))``。|A| >= A_floor が恒等的に成立する。
+
+    ★既定 ``0.0`` は**恒等**（早期 return するので bit 単位で無変更）。
+    上流一致・既存 checkpoint との bit 一致の錨を守るため、既定で 1 bit も変えない。
+
+    Args:
+        A_log: ``self.A_log.float()``
+        A_floor: |A| の下限。``exp(-DT_FLOOR * A_floor)`` が dA の上界になる
+    """
+    if A_floor == A_NO_FLOOR:
+        return -torch.exp(A_log)
+    return -(A_floor + torch.exp(A_log))
